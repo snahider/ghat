@@ -1,50 +1,40 @@
 'use strict';
-import {promises as fs} from 'fs';
-import os from 'os';
-import path from 'path';
-import yaml from 'js-yaml';
-// @ts-expect-error
-import degit from 'degitto';
-import dotProp from 'dot-prop';
-import {outdent} from 'outdent';
-import {promisify} from 'util';
-import splitOnFirst from 'split-on-first';
-import {exec as execCallback} from 'child_process';
+const os = require('os');
+const fs = require('fs/promises');
+const fsSync = require('fs');
+const path = require('path');
+const yaml = require('js-yaml');
+const degit = require('tiged');
+const dotProp = require('dot-prop');
+const {outdent} = require('outdent');
+const {promisify} = require('util');
+const splitOnFirst = require('split-on-first');
 
-// @ts-expect-error
-import getRepoUrl from './parse-repo.js';
+const getRepoUrl = require('./parse-repo.js');
+const exec = promisify(require('child_process').exec);
 
-type YAML = Record<string, any>;
-
-const exec = promisify(execCallback);
-
-export class InputError extends Error {}
-
-export interface Options {
-	set?: string | string[];
-	exclude?: string | string[];
-	verbatim?: boolean;
-}
+class InputError extends Error {}
 
 // TODO: Stop supporting the old one-line version in 2025
 const settingsParser = /# file generated with: npx ghat (?<source>[^\n]+)(?:.+\n# options: (?<options>{[^\n]+})\s*\n)?|# do not edit below[ ,-]+use[ :`]+npx ghat (?<args>[^\n`]+)/is;
 
-async function loadYamlFile(path: string) {
-	const string = await fs.readFile(path, {encoding: 'utf-8'}).catch(() => '');
+
+async function loadYamlFile(path) {
+	const string = await fs.readFile(path, 'utf8').catch(() => '');
 	return {
 		string,
-		parsed: string ? yaml.load(string) as YAML : {}
+		parsed: string ? yaml.load(string) : {}
 	};
 }
 
-async function findYamlFiles(cwd: string, ...sub: string[]) {
+async function findYamlFiles(cwd, ...sub) {
 	try {
 		const contents = await fs.readdir(path.join(cwd, ...sub));
 		return contents
 			.filter(filename => /\.ya?ml$/.test(filename))
 			.map(filename => path.join(...sub, filename));
-	} catch (error: unknown) {
-		if ((error as Error).message.startsWith('ENOENT')) {
+	} catch (error) {
+		if (error.message.startsWith('ENOENT')) {
 			return [];
 		}
 
@@ -52,7 +42,7 @@ async function findYamlFiles(cwd: string, ...sub: string[]) {
 	}
 }
 
-async function getWorkflows(directory: string) {
+async function getWorkflows(directory) {
 	// Expect to find workflows in the specified folder or "workflow template repo"
 	const local = await findYamlFiles(directory);
 	if (local.length > 0) {
@@ -63,10 +53,10 @@ async function getWorkflows(directory: string) {
 	return findYamlFiles(directory, '.github/workflows');
 }
 
-async function parseGhatConfigFromYaml(workflowPath: string) {
+async function parseGhatConfigFromYaml(workflowPath) {
 	const contents = await fs.readFile(workflowPath, 'utf8');
-	const ghatConfig = settingsParser.exec(contents);
-	if (!ghatConfig?.groups) {
+	const ghatConfig = contents.match(settingsParser);
+	if (!ghatConfig) {
 		return;
 	}
 
@@ -104,7 +94,7 @@ async function handleExisting() {
 		'\n' + existing.map(({path}) => '- ' + path).join('\n')
 	);
 
-	await Promise.all(existing.map(async ({source, options, args}) => {
+	await Promise.all(existing.map(({source, options, args}) => {
 		if (source) {
 			return ghat(source, options);
 		}
@@ -117,8 +107,8 @@ async function handleExisting() {
 	}));
 }
 
-export default async function ghat(source: string, {exclude, set, verbatim = false}: Options = {}) {
-	if (!source) {
+async function ghat(source, {mode = "local", exclude, set, verbatim = false} = {}) {
+  if (!source) {
 		if (exclude || set || verbatim) {
 			throw new InputError('If you don’t specifiy a source, any further options won’t be applied');
 		}
@@ -140,35 +130,56 @@ export default async function ghat(source: string, {exclude, set, verbatim = fal
 		set = [set];
 	}
 
-	const getter = degit(source, {
-		force: true,
-		verbose: true
-	});
+  async function cloneInTempDirectory(){
+    const getter = degit(source, {
+      force: true,
+      verbose: true
+    });
+    const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'ghat-'));
+    const file = getter.repo.subdir && path.parse(getter.repo.subdir);
+    // If `source` points to a file, .clone() must receive a path to the file
+    const destination = file?.ext ? path.join(temporaryDirectory, file.base) : temporaryDirectory;
+    await getter.clone(destination);
+    return temporaryDirectory;
+  }
 
-	const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'ghat-'));
-	const file = getter.repo.subdir && path.parse(getter.repo.subdir);
+  var sourceDirectory = "";
+  var templates = []
+  if (mode === "remote"){
+    const temporaryDirectory = await cloneInTempDirectory();
+    sourceDirectory=temporaryDirectory;
+    templates = await getWorkflows(sourceDirectory);
+  }
+  if (mode === "local"){
+    if (!fsSync.existsSync(source)){
+      throw new InputError(`${source} doesn't exists`);
+    }
 
-	// If `source` points to a file, .clone() must receive a path to the file
-	const destination = file?.ext ? path.join(temporaryDirectory, file.base) : temporaryDirectory;
-	await getter.clone(destination);
-
-	const templates = await getWorkflows(temporaryDirectory);
+    const sourceAttributes = fsSync.lstatSync(source)
+    if(sourceAttributes.isDirectory()) {
+      sourceDirectory = source;
+      templates = await getWorkflows(sourceDirectory);
+    } else if (sourceAttributes.isFile()) {
+      sourceDirectory = path.dirname(source);
+      templates = [path.basename(source)];
+    }
+  }
 	if (templates.length === 0) {
 		throw new InputError('No workflows found in ' + source);
 	}
 
 	await fs.mkdir('.github/workflows', {recursive: true});
 
-	const applyTemplate = async (filename: string) => {
+	const applyTemplate = async filename => {
 		const localWorkflowPath = path.join('.github/workflows', path.basename(filename));
-		const remoteWorkflowPath = path.join(temporaryDirectory, filename);
+		const remoteWorkflowPath = path.join(sourceDirectory, filename);
 		const [local, remote] = await Promise.all([
 			loadYamlFile(localWorkflowPath),
 			loadYamlFile(remoteWorkflowPath)
 		]);
 
 		if (verbatim) {
-			await fs.writeFile(localWorkflowPath, remote.string);
+			await fs.writeFile(localWorkflowPath, await remote.string);
 			return;
 		}
 
@@ -196,7 +207,7 @@ export default async function ghat(source: string, {exclude, set, verbatim = fal
 		if (set && set.length > 0) {
 			for (const setting of set) {
 				const [path, value] = splitOnFirst(setting, '=');
-				dotProp.set(remote.parsed, path, yaml.load(value!) as YAML);
+				dotProp.set(remote.parsed, path, yaml.load(value));
 			}
 
 			needsUpdate = true;
@@ -209,8 +220,7 @@ export default async function ghat(source: string, {exclude, set, verbatim = fal
 		}
 
 		const comments = [
-			`FILE GENERATED WITH: npx ghat ${source}`,
-			`SOURCE: ${getRepoUrl(source).url}`
+			`FILE GENERATED WITH: ghat ${source}`,
 		];
 
 		if (exclude || set) {
@@ -223,9 +233,12 @@ export default async function ghat(source: string, {exclude, set, verbatim = fal
 			${yaml.dump({env})}
 			${comments.map(line => '# ' + line).join('\n')}
 
-			${remote.string}`
+			${await remote.string}`
 		);
 	};
 
-	await Promise.all(templates.map(async filename => applyTemplate(filename)));
+	await Promise.all(templates.map(filename => applyTemplate(filename)));
 }
+
+module.exports = ghat;
+module.exports.InputError = InputError;
